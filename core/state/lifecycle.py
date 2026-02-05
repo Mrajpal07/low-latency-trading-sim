@@ -12,7 +12,7 @@ VALID_TRANSITIONS = {
     State.INIT: (State.WARMUP,),
     State.WARMUP: (State.READY, State.DEGRADED),
     State.READY: (State.DEGRADED,),
-    State.DEGRADED: (State.READY,),
+    State.DEGRADED: (State.READY, State.WARMUP),
 }
 
 
