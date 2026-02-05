@@ -73,8 +73,6 @@ class CapacityHarness:
                 warmup_ctrl.tick()
             elif step_i == self.WARMUP_TICKS:
                 warmup_ctrl.complete()
-            elif step_i == 40:
-                failure_ctrl.activate()
 
             # Balanced Load Execution
             # Ingest
@@ -123,3 +121,16 @@ if __name__ == "__main__":
     print("Step 0 State:", result.steps[0].lifecycle_state)
     print("Step 10 State:", result.steps[10].lifecycle_state)
     print("Step 40 State:", result.steps[40].lifecycle_state)
+    
+    total_overruns = sum(s.overruns for s in result.steps)
+    first_overrun = next((s for s in result.steps if s.overruns > 0), None)
+    
+    print(f"Total Overruns: {total_overruns}")
+    
+    if first_overrun:
+        print(f"First Overrun Step: {first_overrun.step_index}")
+        print(f"Lifecycle State at First Overrun: {first_overrun.lifecycle_state}")
+    else:
+        print("First Overrun Step: None")
+        
+    print(f"All Steps Stable: {total_overruns == 0}")

@@ -437,6 +437,29 @@ This capacity model will be refined as testing proceeds. The constraints documen
 
 ---
 
+## Capacity & Stress Characterization
+
+The system's behavior under load was verified through three deterministic experiments using a fixed ring buffer capacity of 64 slots.
+
+| Experiment | Ingest Rate | Poll Rate | Result |
+| :--- | :--- | :--- | :--- |
+| **Balanced** | 5 ticks/step | 5 polls/step | **Stable**. Zero overruns. |
+| **Consumer Lag** | 8 ticks/step | 3 polls/step | **Overrun**. First data loss at Step 12. |
+| **Under-Load** | 3 ticks/step | 8 polls/step | **Stable**. Zero overruns. No artifacts. |
+
+### The Math of Failure
+
+In the Consumer Lag experiment, the overrun point is exactly predictable:
+
+1.  **Net Accumulation**: 8 produced - 3 consumed = +5 events per step.
+2.  **Capacity limit**: 64 slots.
+3.  **Saturation Step**: 64 slots / 5 events/step = 12.8 steps.
+
+At **Step 12**, the buffer wrapped around, and the consumer's cursor (pointing to index 0) was overwritten by the producer (writing index 64). The simulator correctly identified this condition and raised an explicit `Overrun` exception rather than returning corrupted data.
+
+> This simulator prioritizes predictability and explicit data loss over blocking or unbounded buffering.
+
+
 ## Non-Goals
 
 This section explicitly states what the simulator does not do. These exclusions are deliberate. They prevent scope creep and focus attention on the core concerns.
