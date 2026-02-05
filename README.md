@@ -2,24 +2,26 @@
 
 ## Project Overview
 
-This project is a low-latency trading infrastructure simulator focused on **execution-path mechanics**, **lifecycle control**, and **operational behavior** rather than trading strategy.
+This project simulates the **infrastructure layer** of a high-frequency trading system—the execution mechanics, lifecycle management, and operational behavior that determine whether trades happen reliably and on time. It deliberately ignores trading strategy, market dynamics, and financial logic to focus exclusively on the concerns that HFT DevOps engineers, platform teams, and systems programmers face daily.
 
-It models how real HFT systems:
-- Ingest market data with deterministic timestamps
-- Fan out events to multiple consumers without blocking producers
-- Execute under strict latency constraints with explicit state gating
-- Degrade predictably under failure conditions
-- Remain observable without disturbing the hot path
+### What This System Represents
 
-**This is not:**
-- A trading strategy backtester
-- A market simulator with realistic order book dynamics
-- A distributed system (single-host, vertical scaling only)
-- Production-ready code (educational/interview artifact)
+A real HFT platform is more than algorithms. Before any trading logic runs, infrastructure must ensure that market data arrives with trustworthy timestamps, events fan out to multiple consumers without blocking the critical path, the system knows whether it's healthy enough to execute, failures degrade gracefully rather than crash, and observability exists without adding latency. This simulator models those concerns in isolation, making the architectural patterns visible and testable without the complexity of actual market connectivity or trading logic.
 
-**Why it exists:**
+### Who Would Care About This
 
-To demonstrate understanding of the infrastructure concerns that HFT DevOps and systems engineers face daily: protecting latency, managing state transitions, handling degradation, and building observability that doesn't lie.
+- **HFT DevOps / SRE engineers** who need to understand how trading infrastructure behaves under pressure
+- **Platform engineers** building low-latency event processing systems in any domain
+- **Systems programmers** learning patterns that transfer to C++ or Rust implementations
+- **Interviewers and candidates** discussing infrastructure design for latency-sensitive applications
+
+### Non-Negotiable Constraints
+
+The hot path—the code that touches every event—must be predictable. This means no locks that could cause contention, no dynamic memory allocation that could trigger garbage collection, no system calls that could block, and no conditional branches based on observability state. These constraints are not optimizations to add later; they are architectural invariants that shape every design decision.
+
+### What This Is Not
+
+This is not a trading strategy backtester, a market simulator with order book dynamics, a distributed system, or production-ready code. It exists as an educational and interview artifact that demonstrates understanding of infrastructure principles, not as something you would deploy.
 
 ---
 
@@ -27,23 +29,33 @@ To demonstrate understanding of the infrastructure concerns that HFT DevOps and 
 
 ### 1. Protect the Hot Path
 
-The execution-critical path has exactly one job: process events with minimal, predictable latency. Everything else—metrics, logging, health checks—happens elsewhere. No locks, no allocations, no syscalls on the hot path.
+The execution-critical path has exactly one job: process events with minimal, predictable latency. Everything else—metrics, logging, health checks—happens elsewhere.
+
+**Why this matters:** In production HFT systems, a single lock acquisition on the hot path can add microseconds of jitter. A garbage collection pause can miss a trading opportunity. By establishing absolute separation between the hot path and supporting infrastructure, we ensure that operational concerns never compete with execution for resources or time.
 
 ### 2. Explicit State Over Inference
 
-The system's operational state is always explicit. `INIT → WARMUP → READY → DEGRADED` is a state machine with validated transitions, not a set of boolean flags that might drift. Components check state; they don't guess.
+The system's operational state is always explicit. The lifecycle is a state machine with validated transitions, not a set of boolean flags that might drift out of sync. Components check state; they don't guess.
+
+**Why this matters:** Distributed systems fail in subtle ways when components disagree about system state. A service that *thinks* it's healthy but isn't will accept traffic it can't handle. By making state explicit and transitions validated, we ensure that every component has the same understanding of whether the system should be executing, warming up, or degraded.
 
 ### 3. Determinism Over Throughput
 
-We prefer predictable latency over peak throughput. A system that processes 100k events/sec with p99 of 50μs is more valuable than one that does 500k events/sec with p99 of 5ms. Known bottlenecks are features, not bugs.
+We prefer predictable latency over peak throughput. A system that processes fewer events per second but with consistent timing is more valuable than one with higher throughput and unpredictable spikes.
+
+**Why this matters:** Trading systems make decisions based on timing. If latency varies unpredictably, the system cannot reason about whether its view of the market is current. Known, stable latency—even if higher—enables correct decision-making. Unknown latency makes the system unreliable regardless of average performance.
 
 ### 4. Degrade Before Failing
 
-When things go wrong, the system sheds load and signals degradation rather than crashing or lying. Slow consumers get dropped. Execution continues in degraded mode. Metrics report honestly, even if that means "I don't know."
+When things go wrong, the system sheds load and signals degradation rather than crashing or lying. Slow consumers get dropped. Execution continues in degraded mode. Metrics report honestly.
+
+**Why this matters:** Markets don't pause for system failures. A crashed trading system loses all optionality—it cannot even observe what's happening. A degraded system can still gather data, report its state, and recover when conditions improve. Graceful degradation preserves information and options that hard failures destroy.
 
 ### 5. Observability Must Not Lie
 
-Metrics that block the hot path are worse than no metrics. We accept lossy, best-effort aggregation. Thread-local counters, async snapshots, approximate values under stress. If observability can't keep up, it drops data—it never adds latency.
+Metrics that block the hot path are worse than no metrics. We accept lossy, best-effort aggregation over precise measurements that add latency.
+
+**Why this matters:** The purpose of observability is to understand system behavior. If collecting metrics changes that behavior—by adding latency, triggering allocations, or competing for CPU—then the metrics describe a different system than the one running without observation. Honest observability accepts that some data may be lost under stress rather than distorting the system it measures.
 
 ---
 
@@ -95,211 +107,59 @@ Metrics that block the hot path are worse than no metrics. We accept lossy, best
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Data Flow Direction
+### What Each Layer Represents
 
-1. **Market Data Ingest** emits events with monotonic timestamps
-2. **Ring Buffer** stores events; producer never blocks
-3. **Consumers** (including Executor) read independently via cursors
-4. **Executor** produces Ack records with decision/completion timestamps
-5. **Observability Sink** receives (event, ack) pairs via null-object pattern
+**Control Plane** contains components that monitor and influence the system but never touch individual events. Metrics aggregation, health probes, and failure injection scenarios all live here. These components can be slow, allocate memory, make system calls, and block—because they operate outside the critical path.
 
-### What Does NOT Talk to What
+**Lifecycle State** is the single source of truth for system operational status. Every component that needs to know whether execution is permitted reads from this state. The state machine enforces valid transitions: you cannot jump from initialization directly to degraded, and you cannot execute during initialization. This layer is minimal—it stores one enum value and validates transitions.
 
-| Component | Cannot Import |
-|-----------|---------------|
-| `core/*` (hot path) | `control/*`, `runtime/*` |
-| `control/metrics` | `core/bus`, `core/execution` |
-| `control/failure` | `core/bus`, `core/execution`, `core/ingest` |
-| Observability sink | `control/*` (lives in core, protocol only) |
+**Hot Path** is where market events flow. Data enters through ingestion, passes through the ring buffer for fan-out to multiple consumers, and reaches the execution consumer that produces acknowledgment records. Every operation here uses monotonic timestamps, avoids locks, and makes no allocations. The hot path is latency-critical and must remain undisturbed.
 
-This layering is enforced by tests that parse imports via AST.
+**Runtime Control** manages process lifecycle concerns that happen outside normal event processing: warming up caches and JIT compilation before accepting traffic, probing readiness for orchestration systems, and coordinating graceful shutdown. These components interact with lifecycle state but never with the hot path directly.
 
----
+### How Data Flows
 
-## Component Details
+Market data enters the system through the ingest component, which stamps each event with a monotonic timestamp at arrival time. Events are published to the ring buffer, which stores them in a fixed-size circular structure. Multiple consumers can read from the buffer independently, each maintaining its own cursor position. The execution consumer reads events, makes execution decisions based on lifecycle state, and produces acknowledgment records that capture both when the decision was made and when processing completed. These acknowledgments flow to an observability sink using the null-object pattern.
 
-### Monotonic Timestamping (`core/time`)
+### How Control Influences the Hot Path
 
-```python
-now() -> int          # Returns perf_counter_ns()
-delta(start, end) -> int  # Pure subtraction
-```
+Control plane components influence the hot path through exactly one mechanism: lifecycle state. The failure injection system transitions the lifecycle to DEGRADED, which causes the executor to process events but mark them as not executed. The warm-up controller transitions from WARMUP to READY when the system is prepared for production traffic. Health probes read lifecycle state to report readiness.
 
-- Uses `time.perf_counter_ns()` — monotonic, nanosecond precision
-- No wall clock on hot path (wall clock is control plane only)
-- Enables deterministic latency attribution
+Critically, control plane components never write to hot-path data structures, never inject code into the event processing loop, and never hold locks that hot-path code might need. The influence is indirect and mediated entirely through the validated state machine.
 
-### Ring Buffer (`core/bus`)
+### What Isolation Exists
 
-```python
-RingBuffer[T](capacity)
-  .publish(item) -> seq    # Never blocks, returns sequence number
-  .get(seq) -> T           # Raises Overrun if data was overwritten
-  .head() -> int           # Current write position
+The architecture enforces strict import boundaries. Hot-path code in the core layer cannot import from control or runtime layers. This is not a convention—it is verified by tests that parse the abstract syntax tree of every source file. If hot-path code accidentally imports a control-plane module, tests fail.
 
-Consumer[T](ring)
-  .poll() -> T | None      # Returns item or None if caught up
-  .available() -> int      # Count of unread items
-  .reset_to_head()         # Recovery after overrun
-```
+The observability sink illustrates this isolation. The sink protocol is defined in the core layer because the executor needs to call it. But actual sink implementations that aggregate metrics live in the control layer. The executor receives a sink through dependency injection and calls its method on every event—if no real observability is configured, it receives a no-op implementation that compiles to nearly zero instructions.
 
-**Key Properties:**
-- Fixed-size, pre-allocated buffer
-- Lock-free single-producer design
-- Independent cursor per consumer
-- Explicit `Overrun` exception (not silent data loss)
-- Producer independence: slow consumers never block publishing
-
-### Lifecycle State Machine (`core/state`)
-
-```
-        ┌─────────────────────────┐
-        │                         │
-        ▼                         │
-      INIT ──► WARMUP ──► READY ◄─┴─► DEGRADED
-                  │                      │
-                  └──────────────────────┘
-```
-
-| Transition | When |
-|------------|------|
-| INIT → WARMUP | System starting, caches cold |
-| WARMUP → READY | Warm-up complete, latency stable |
-| WARMUP → DEGRADED | Failure during warm-up |
-| READY → DEGRADED | Failure detected |
-| DEGRADED → READY | Recovery confirmed |
-| DEGRADED → WARMUP | Full restart required |
-
-**Invalid transitions raise `InvalidTransition`.**
-
-### Execution (`core/execution`)
-
-```python
-Executor(ring, lifecycle, sink=None)
-  .process() -> Ack | None   # Consumes one event, returns ack
-  .cursor() -> int           # Current read position
-
-Ack:
-  .seq             # Sequence number of processed event
-  .decision_ts     # When decision logic ran (monotonic)
-  .completion_ts   # When ack was constructed (monotonic)
-  .executed        # True only if state was READY
-```
-
-**Execution Semantics:**
-- `INIT` state → raises `NotReady`
-- `WARMUP` / `DEGRADED` → processes but `executed=False`
-- `READY` → processes with `executed=True`
-- No events available → returns `None` immediately (non-blocking)
-
-### Observability Sink (`core/execution/observability`)
-
-```python
-class ObservabilitySink(Protocol):
-    def observe(self, event: Any, ack: Ack) -> None: ...
-
-class NoOpSink:
-    def observe(self, event: Any, ack: Ack) -> None:
-        pass  # Zero-cost when observability disabled
-```
-
-**Why null-object pattern:**
-- No `if sink is not None:` branching on every event
-- Executor always calls `sink.observe()` — it's either NoOp or real
-- Sink protocol lives in `core/` but implementations can live in `control/`
-
-### Metrics Aggregator (`control/metrics`)
-
-```python
-Metrics()
-  .observe(latency_ns)     # O(1), no allocation
-  .snapshot() -> Snapshot  # Returns immutable copy
-  .reset() -> Snapshot     # Atomic snapshot + reset
-
-Snapshot:
-  .count, .total_latency_ns, .min_latency_ns, .max_latency_ns
-```
-
-**Hot-Path Safety:**
-- No locks (single-threaded aggregation assumed)
-- No allocations in `observe()`
-- Lossy under stress (acceptable)
-- `snapshot()` and `reset()` are control-plane operations
-
-### Failure Injection (`control/failure`)
-
-```python
-MarketDataOutage(lifecycle)
-ExecutionFailure(lifecycle)
-  .activate()      # Transitions to DEGRADED, saves previous state
-  .deactivate()    # Restores previous state
-  .is_active()     # Returns current status
-```
-
-**Properties:**
-- Uses only valid lifecycle transitions (no monkey-patching)
-- Idempotent activation/deactivation
-- Cannot activate from INIT or DEGRADED states
-- Does not import hot-path modules
+This layering ensures that changes to metrics collection, health checking, or failure injection cannot accidentally add latency to event processing.
 
 ---
 
-## Failure & Degradation Table
+## Failure & Degradation Behavior
 
-| Failure Scenario | Detection | System Response | Recovery |
-|-----------------|-----------|-----------------|----------|
-| **Slow Consumer** | `head - cursor > capacity` | `Overrun` raised on read | `consumer.reset_to_head()` |
-| **Market Data Outage** | External signal | Lifecycle → DEGRADED | `scenario.deactivate()` |
-| **Execution Backlog** | Consumer falls behind | Overrun, events dropped | Reset cursor, continue |
-| **Cold Start** | `state == INIT` | `NotReady` exception | Complete warm-up cycle |
-| **Warm-up Incomplete** | `state == WARMUP` | Execution allowed, `executed=False` | Wait for READY transition |
-| **State Corruption** | Invalid transition attempted | `InvalidTransition` raised | Explicit operator action |
+The system handles failure through explicit state transitions rather than exceptions or crashes.
 
-### Degradation Philosophy
+**Slow consumers** that fall behind the ring buffer receive an explicit overrun signal when they try to read data that has been overwritten. They can recover by resetting their cursor to the current buffer head, accepting that some events were missed.
 
-```
-Normal Operation     Degraded Operation     Failure
-      │                     │                  │
-      │   shed load         │   explicit       │
-      │   ──────────►       │   signal         │
-      │                     │   ──────────►    │
-      │                     │                  │
-   READY              DEGRADED           (no crash)
-```
+**External failures** like market data outages trigger lifecycle transitions to DEGRADED state. In this state, the system continues processing events but marks execution decisions as provisional. When the failure clears, the system transitions back to READY.
 
-The system does not crash under load. It:
-1. Drops data at the ring buffer (producer never blocks)
-2. Signals degradation via lifecycle state
-3. Continues processing with `executed=False`
-4. Reports honest metrics (including "unknown" during stress)
+**Cold starts** go through a mandatory warm-up phase. During warm-up, caches are cold, branch predictors are untrained, and latency measurements are unreliable. The system processes events during warm-up but does not trust its own timing. Only after warm-up completes does the system transition to READY for production execution.
+
+**Invalid operations** like attempting to execute during initialization raise explicit exceptions. The system refuses to silently do the wrong thing—it fails loudly when preconditions are violated.
+
+The philosophy is that degradation preserves options while failure destroys them. A degraded system can observe, report, and recover. A crashed system cannot.
 
 ---
 
-## What This System Does NOT Do
+## Limitations and Honest Assessment
 
-| Limitation | Why |
-|------------|-----|
-| **No multi-threading** | Python GIL makes lock-free claims meaningless in true concurrent scenarios. Single-threaded model is honest. |
-| **No actual network I/O** | This is a simulator. Real market data feeds would require kernel bypass, FPGA, etc. |
-| **No persistence** | Hot path has no disk I/O. State is in-memory only. |
-| **No distributed coordination** | Single-host design. Distributed systems introduce latency that defeats the purpose. |
-| **No microsecond latency** | Python's baseline overhead is ~100ns per function call. We model the *architecture*, not the absolute numbers. |
-| **No order book simulation** | This is infrastructure, not market simulation. Events are opaque to the bus. |
+This system demonstrates understanding of low-latency principles, not production performance. It runs in Python, which means function call overhead, garbage collection pauses, and the global interpreter lock all prevent true low-latency execution. A production HFT system would use C++ or Rust for the hot path, pin threads to CPU cores, use huge pages and NUMA-aware allocation, and bypass the kernel for network I/O.
 
-### Honest Assessment
+What transfers from this project is not the absolute performance numbers but the architectural patterns: ring buffers for bounded fan-out, state machines for lifecycle management, null-object patterns for zero-cost abstraction, and strict layering to protect critical paths. These patterns apply regardless of implementation language.
 
-This system demonstrates *understanding* of low-latency principles, not production performance. A real HFT system would:
-
-- Use C++ or Rust for the hot path
-- Pin threads to CPU cores
-- Use huge pages and NUMA-aware allocation
-- Bypass the kernel for network I/O
-- Measure in nanoseconds, not microseconds
-
-What transfers from this project:
-- **Architectural patterns** (ring buffers, state machines, fan-out)
-- **Operational concerns** (warm-up, degradation, observability)
-- **Design discipline** (layering, explicit failures, determinism)
+The single-threaded model is also a deliberate simplification. Real systems use thread-per-core designs with careful memory isolation. This simulator avoids threading to keep the architectural patterns clear and to avoid false claims about lock-free behavior that Python cannot actually deliver.
 
 ---
 
@@ -329,48 +189,27 @@ low-latency-trading-sim/
 
 ---
 
-## Running Tests
-
-```bash
-# All tests
-PYTHONPATH=. pytest tests/ -v
-
-# Specific module
-PYTHONPATH=. pytest tests/core/test_bus.py -v
-
-# With coverage
-PYTHONPATH=. pytest tests/ --cov=core --cov=control
-```
-
-**Test Properties:**
-- No sleeps or timing assumptions
-- Deterministic (same input → same output)
-- Fast (<1 second total)
-- 150+ tests covering all components
-
----
-
 ## Questions This System Can Answer
 
 For interviews or design discussions:
 
 1. **"How do you prevent slow consumers from affecting producers?"**
-   → Ring buffer with independent cursors. Producer overwrites; consumer gets `Overrun`.
+   The ring buffer design ensures producers never block. Consumers read independently with their own cursors, and if they fall behind, they receive explicit notification rather than blocking the producer.
 
 2. **"How do you handle failure without crashing?"**
-   → Lifecycle state machine. Transition to DEGRADED, continue processing with `executed=False`.
+   The lifecycle state machine supports graceful degradation. Components check state before executing and adjust behavior accordingly, continuing to process while signaling that execution decisions are provisional.
 
 3. **"How do you add observability without adding latency?"**
-   → Null-object pattern. `NoOpSink` is always called; it's a no-op when disabled.
+   The null-object pattern means observability calls are always made—but when disabled, they resolve to empty implementations. No conditional branches check whether observability is enabled on every event.
 
 4. **"Why not use a queue?"**
-   → Queues can block producers. Ring buffers have bounded, predictable behavior.
+   Queues can block producers when full. Ring buffers have bounded, predictable behavior: the producer always succeeds, and consumers either keep up or receive explicit overrun notification.
 
 5. **"What's the difference between WARMUP and READY?"**
-   → Cold caches, JIT compilation, branch predictor training. WARMUP metrics are unreliable.
+   During warm-up, caches are cold, JIT compilation is incomplete, and branch predictors are untrained. Measurements during warm-up do not reflect steady-state performance. READY means the system's latency characteristics have stabilized.
 
 6. **"How do you test failure scenarios without randomness?"**
-   → Explicit `FailureScenario` objects with `activate()`/`deactivate()`. Deterministic.
+   Failure scenarios are explicit objects with deterministic activation and deactivation. Tests control exactly when failures occur, making failure behavior reproducible and verifiable.
 
 ---
 
