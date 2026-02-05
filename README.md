@@ -1,29 +1,38 @@
 # Low-Latency Trading Infrastructure Simulator
 
-## Project Overview
+**A deterministic, zero-allocation reference architecture for HFT hot-path engineering.**
 
-This project simulates the **infrastructure layer** of a high-frequency trading system. It focuses on execution mechanics, lifecycle management, and operational behavior that determine whether trades happen reliably and on time. It deliberately ignores trading strategy, market dynamics, and financial logic to focus exclusively on the concerns that HFT DevOps engineers, platform teams, and systems programmers face daily.
+This project demonstrates the infrastructure layer of a high-frequency trading system. It isolates the mechanical concerns—lifecycle management, data distribution, execution safety, and failure recovery—from the trading strategy itself.
 
-### What This System Represents
+## ⚡ Quick Verification
 
-A real HFT platform is more than algorithms. Before any trading logic runs, infrastructure must ensure that market data arrives with trustworthy timestamps, events fan out to multiple consumers without blocking the critical path, the system knows whether it is healthy enough to execute, failures degrade gracefully rather than crash, and observability exists without adding latency. This simulator models those concerns in isolation, making the architectural patterns visible and testable without the complexity of actual market connectivity or trading logic.
+You don't have to read the code to verify the claims. The system includes a deterministic CLI demo that runs in milliseconds:
 
-### Who Would Care About This
+```bash
+# Prove stable execution (5 ingest/step vs 5 polls/step)
+python -m demo balanced
 
-- **HFT DevOps / SRE engineers** who need to understand how trading infrastructure behaves under pressure
-- **Platform engineers** building low-latency event processing systems in any domain
-- **Systems programmers** learning patterns that transfer to C++ or Rust implementations
-- **Interviewers and candidates** discussing infrastructure design for latency-sensitive applications
+# Prove precise backpressure (8 ingest/step vs 3 polls/step)
+# Watch for "first_overrun_step: 12" — precise mathematical saturation at step 12.8
+python -m demo producer-heavy
 
-### Non-Negotiable Constraints
+# Prove runtime authority (READY -> DEGRADED -> READY)
+python -m demo failure-recovery
+```
 
-The hot path, meaning the code that touches every event, must be predictable. This means no locks that could cause contention, no dynamic memory allocation that could trigger garbage collection, no system calls that could block, and no conditional branches based on observability state. These constraints are not optimizations to add later. They are architectural invariants that shape every design decision.
+## 🛠 What This System Demonstrates
 
-### What This Is Not
+This is not a backtester. It is a rigor-focused implementation of **production infrastructure patterns**:
 
-This is not a trading strategy backtester, a market simulator with order book dynamics, a distributed system, or production-ready code. It exists as an educational and interview artifact that demonstrates understanding of infrastructure principles, not as something you would deploy.
+*   **Zero-Allocation Hot Path**: The critical loop creates zero garbage. No `malloc`, no `GC` on the critical path.
+*   **Wait-Free Ring Buffer**: Single-producer/multi-consumer layout where the producer *never* blocks.
+*   **Monotonic Time Authority**: Wall-clock time is banned on the hot path to prevent NTP jumps.
+*   **Explicit Lifecycle**: A formal state machine (`INIT` -> `WARMUP` -> `READY`) gates all execution.
+*   **Honest Observability**: Metrics are lossy by design. If the metrics subsystem falls behind, it drops data rather than blocking the trading loop.
 
 ---
+
+*(Detailed architectural documentation follows)*
 
 ## Design Principles
 
@@ -459,6 +468,7 @@ At **Step 12**, the buffer wrapped around, and the consumer's cursor (pointing t
 
 > This simulator prioritizes predictability and explicit data loss over blocking or unbounded buffering.
 
+---
 
 ## Non-Goals
 
@@ -540,7 +550,7 @@ The lifecycle state machine in core/state should not be extended with new states
 
 The timestamp functions in core/time should not be replaced with alternative implementations. The choice of monotonic time over wall time is fundamental. Changing this would invalidate all the latency reasoning in the system.
 
-Import boundaries should never be violated. If you find yourself wanting to import a control-layer module from core, stop. The design needs to change so that the dependency flows the other way or does not exist at all.
+Import boundaries should never be violated. If you find yourself wanting to import a control-layer module from core, stop. The design needs to change so that dependency flows the other way or does not exist at all.
 
 ### Signs of Architectural Drift
 
