@@ -410,3 +410,246 @@ def test_process_does_not_block():
     # Call many times rapidly - should never block
     results = [ex.process() for _ in range(1000)]
     assert all(r is None for r in results)
+
+
+# === Feature 7: Observability Wiring Tests ===
+
+
+from core.execution import ObservabilitySink, NoOpSink
+
+
+class RecordingSink:
+    """Test sink that records all observations."""
+
+    def __init__(self):
+        self.observations = []
+
+    def observe(self, event, ack):
+        self.observations.append((event, ack))
+
+
+def test_default_sink_is_noop():
+    """Executor uses NoOpSink by default."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    ex = Executor(ring, lc)
+
+    # Should work without any sink configuration
+    ring.publish(100)
+    ack = ex.process()
+    assert ack is not None
+    assert ack.seq == 0
+
+
+def test_custom_sink_receives_observations():
+    """Custom sink's observe() is called for each event."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    ring.publish(100)
+    ring.publish(200)
+
+    ex.process()
+    ex.process()
+
+    assert len(sink.observations) == 2
+
+
+def test_sink_receives_correct_event():
+    """Sink receives the actual event from the ring."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    ring.publish(42)
+    ring.publish(99)
+
+    ex.process()
+    ex.process()
+
+    assert sink.observations[0][0] == 42
+    assert sink.observations[1][0] == 99
+
+
+def test_sink_receives_correct_ack():
+    """Sink receives ack with correct seq and executed flag."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    lc.transition(State.READY)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    ring.publish(100)
+    ack = ex.process()
+
+    observed_event, observed_ack = sink.observations[0]
+    assert observed_ack.seq == ack.seq
+    assert observed_ack.executed == ack.executed
+    assert observed_ack.decision_ts == ack.decision_ts
+    assert observed_ack.completion_ts == ack.completion_ts
+
+
+def test_sink_not_called_when_no_event():
+    """Sink.observe() not called when process() returns None."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    # No events published
+    result = ex.process()
+    assert result is None
+    assert len(sink.observations) == 0
+
+
+def test_sink_called_exactly_once_per_event():
+    """Each event triggers exactly one observe() call."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    for i in range(5):
+        ring.publish(i)
+
+    for _ in range(5):
+        ex.process()
+
+    assert len(sink.observations) == 5
+
+    # Subsequent calls with no events don't trigger observe
+    for _ in range(10):
+        ex.process()
+
+    assert len(sink.observations) == 5
+
+
+def test_noop_sink_does_nothing():
+    """NoOpSink.observe() can be called without error."""
+    sink = NoOpSink()
+    # Create a mock ack-like object
+    class FakeAck:
+        seq = 0
+        decision_ts = 1000
+        completion_ts = 2000
+        executed = True
+
+    # Should not raise
+    sink.observe(42, FakeAck())
+    sink.observe("event", FakeAck())
+    sink.observe(None, FakeAck())
+
+
+def test_multiple_executors_different_sinks():
+    """Each executor can have its own independent sink."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+
+    sink1 = RecordingSink()
+    sink2 = RecordingSink()
+
+    ex1 = Executor(ring, lc, sink=sink1)
+    ex2 = Executor(ring, lc, sink=sink2)
+
+    ring.publish(100)
+    ring.publish(200)
+
+    ex1.process()
+    ex1.process()
+
+    ex2.process()
+
+    assert len(sink1.observations) == 2
+    assert len(sink2.observations) == 1
+
+
+def test_sink_receives_observations_in_order():
+    """Observations are received in processing order."""
+    ring = RingBuffer[int](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    for i in range(5):
+        ring.publish(i * 10)
+
+    for _ in range(5):
+        ex.process()
+
+    events = [obs[0] for obs in sink.observations]
+    assert events == [0, 10, 20, 30, 40]
+
+
+def test_observability_no_control_imports():
+    """Verify observability.py doesn't import from control.*"""
+    import ast
+    with open("core/execution/observability.py", "r") as f:
+        source = f.read()
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith("control"), \
+                    f"Layering violation: imports {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                assert not node.module.startswith("control"), \
+                    f"Layering violation: imports from {node.module}"
+
+
+def test_execution_unchanged_with_sink():
+    """Execution behavior identical with or without custom sink."""
+    ring1 = RingBuffer[int](8)
+    ring2 = RingBuffer[int](8)
+    lc1 = Lifecycle()
+    lc2 = Lifecycle()
+    lc1.transition(State.WARMUP)
+    lc1.transition(State.READY)
+    lc2.transition(State.WARMUP)
+    lc2.transition(State.READY)
+
+    # One with default sink, one with custom
+    ex_default = Executor(ring1, lc1)
+    ex_custom = Executor(ring2, lc2, sink=RecordingSink())
+
+    ring1.publish(42)
+    ring2.publish(42)
+
+    ack1 = ex_default.process()
+    ack2 = ex_custom.process()
+
+    assert ack1.seq == ack2.seq
+    assert ack1.executed == ack2.executed
+
+
+def test_sink_with_complex_event_types():
+    """Sink works with non-primitive event types."""
+    class ComplexEvent:
+        def __init__(self, data):
+            self.data = data
+
+    ring = RingBuffer[ComplexEvent](8)
+    lc = Lifecycle()
+    lc.transition(State.WARMUP)
+    sink = RecordingSink()
+    ex = Executor(ring, lc, sink=sink)
+
+    event = ComplexEvent({"key": "value"})
+    ring.publish(event)
+    ex.process()
+
+    observed_event, _ = sink.observations[0]
+    assert observed_event is event
+    assert observed_event.data == {"key": "value"}
